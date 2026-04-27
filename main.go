@@ -1103,7 +1103,7 @@ func resolvePlanSlug(name string, content []byte) string {
 func connectOrStartDaemon(key string, args []string, noOpen bool) (sessionEntry, bool) {
 	entry, alive := findAliveSession(key)
 	if alive {
-		fmt.Fprintf(os.Stderr, "Connected to crit daemon on port %d\n", entry.Port)
+		fmt.Fprintf(os.Stderr, "Connected to crit daemon: http://localhost:%d\n", entry.Port)
 		if !noOpen && !daemonHasBrowser(entry) {
 			go openBrowser(fmt.Sprintf("http://localhost:%d", entry.Port))
 		}
@@ -1116,7 +1116,7 @@ func connectOrStartDaemon(key string, args []string, noOpen bool) (sessionEntry,
 		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 		os.Exit(1)
 	}
-	fmt.Fprintf(os.Stderr, "Started crit daemon on port %d (PID %d)\n", entry.Port, entry.PID)
+	fmt.Fprintf(os.Stderr, "Started crit daemon: http://localhost:%d (PID %d)\n", entry.Port, entry.PID)
 	return entry, true
 }
 
@@ -1415,7 +1415,7 @@ func runReview(args []string) {
 	weStartedDaemon := false
 
 	if alive {
-		fmt.Fprintf(os.Stderr, "Connected to crit daemon on port %d\n", entry.Port)
+		fmt.Fprintf(os.Stderr, "Connected to crit daemon: http://localhost:%d\n", entry.Port)
 		// Re-open browser if no browser tab is connected (user closed it)
 		if !sc.noOpen && !daemonHasBrowser(entry) {
 			go openBrowser(fmt.Sprintf("http://localhost:%d", entry.Port))
@@ -1427,7 +1427,7 @@ func runReview(args []string) {
 			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
 			os.Exit(1)
 		}
-		fmt.Fprintf(os.Stderr, "Started crit daemon on port %d (PID %d)\n", entry.Port, entry.PID)
+		fmt.Fprintf(os.Stderr, "Started crit daemon: http://localhost:%d (PID %d)\n", entry.Port, entry.PID)
 		weStartedDaemon = true
 	}
 
@@ -1870,7 +1870,7 @@ func runIdleTimeoutChecker(ctx context.Context, stop context.CancelFunc, idleMu 
 }
 
 func runServe(args []string) {
-	pipe := openReadyPipe()
+	pipe := openReadyWriter()
 
 	sc, err := resolveServerConfig(args)
 	if err != nil {
@@ -1879,7 +1879,9 @@ func runServe(args []string) {
 	if sc == nil {
 		return
 	}
-	sc.quiet = true
+	if pipe != nil {
+		sc.quiet = true
+	}
 
 	listener, err := bindListener(sc.port)
 	if err != nil {
@@ -1967,6 +1969,9 @@ func runServe(args []string) {
 	// operations finish (no context is threaded into the git calls). This is
 	// acceptable because the timeout path sets initErr, which triggers a full
 	// server shutdown and process exit shortly after, cleaning up all goroutines.
+	if pipe == nil {
+		log.Printf("Creating session (cwd=%s)...", cwd)
+	}
 	go func() {
 		s, err := createSession(sc)
 		ch <- sessionResult{s, err}
@@ -1992,6 +1997,10 @@ func runServe(args []string) {
 	}
 	applySessionOverrides(session, sc)
 	session.CLIArgs = sc.files
+
+	if pipe == nil {
+		log.Printf("Session ready (%d file(s)), listening on http://localhost:%d", len(session.Files), addr.Port)
+	}
 
 	checkStaleIntegrations(sc, srv, cwd)
 

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -11,9 +10,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
-	"syscall"
 	"time"
 )
 
@@ -311,7 +308,7 @@ func isDaemonAlive(s sessionEntry) bool {
 		return false
 	}
 	// On Unix, FindProcess always succeeds. Signal 0 checks existence without signaling.
-	if err := proc.Signal(syscall.Signal(0)); err != nil {
+	if !isProcessAlive(proc) {
 		return false
 	}
 	// HTTP health probe — ensures the port belongs to our daemon, not a reused PID.
@@ -376,7 +373,7 @@ func acquireSessionLock(key string) (*os.File, error) {
 	deadline := time.Now().Add(5 * time.Second)
 	backoff := 100 * time.Millisecond
 	for time.Now().Before(deadline) {
-		err = syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
+		err = flockExclusive(f, false)
 		if err == nil {
 			return f, nil
 		}
@@ -391,16 +388,16 @@ func acquireSessionLock(key string) (*os.File, error) {
 
 // releaseSessionLock unlocks, closes, and removes the lock file.
 func releaseSessionLock(f *os.File) {
-	syscall.Flock(int(f.Fd()), syscall.LOCK_UN)
+	flockUnlock(f)
 	name := f.Name()
 	f.Close()
 	os.Remove(name)
 }
 
 // setupDaemonCmd creates and configures the daemon child process.
-// Returns the command, readiness pipe read-end, write-end, log file, and any error.
-// The caller must close writeEnd and logFile after Start().
-func setupDaemonCmd(key string, args []string) (*exec.Cmd, *os.File, *os.File, *os.File, error) {
+// Returns the command, readyChannel, writeEnd (may be nil on Windows), log file, and any error.
+// The caller must close writeEnd (if non-nil) and logFile after Start().
+func setupDaemonCmd(key string, args []string) (*exec.Cmd, *readyChannel, *os.File, *os.File, error) {
 	selfPath, err := os.Executable()
 	if err != nil {
 		return nil, nil, nil, nil, fmt.Errorf("finding executable: %w", err)
@@ -427,45 +424,19 @@ func setupDaemonCmd(key string, args []string) (*exec.Cmd, *os.File, *os.File, *
 	}
 	cmd.Stderr = logFile
 
-	readEnd, writeEnd, err := os.Pipe()
+	rc, writeEnd, err := setupReadinessIPC(cmd)
 	if err != nil {
 		logFile.Close()
-		return nil, nil, nil, nil, fmt.Errorf("creating readiness pipe: %w", err)
+		return nil, nil, nil, nil, err
 	}
-	cmd.ExtraFiles = []*os.File{writeEnd}
-	cmd.Env = append(os.Environ(), "_CRIT_READY_FD=3")
 	cmd.SysProcAttr = daemonSysProcAttr()
 
-	return cmd, readEnd, writeEnd, logFile, nil
-}
-
-func readPortFromPipe(readEnd *os.File) (portCh chan int, errCh chan error) {
-	portCh = make(chan int, 1)
-	errCh = make(chan error, 1)
-	go func() {
-		scanner := bufio.NewScanner(readEnd)
-		if !scanner.Scan() {
-			errCh <- fmt.Errorf("daemon closed readiness pipe without writing")
-			return
-		}
-		line := scanner.Text()
-		if strings.HasPrefix(line, "error:") {
-			errCh <- fmt.Errorf("%s", strings.TrimPrefix(line, "error:"))
-			return
-		}
-		port, err := strconv.Atoi(line)
-		if err != nil {
-			errCh <- fmt.Errorf("daemon wrote invalid port: %q", line)
-			return
-		}
-		portCh <- port
-	}()
-	return portCh, errCh
+	return cmd, rc, writeEnd, logFile, nil
 }
 
 //nolint:unparam // error return is kept for consistent startDaemon select-case handling
-func handleDaemonReady(key string, port, pid int, readEnd *os.File, cmd *exec.Cmd) (sessionEntry, error) {
-	readEnd.Close()
+func handleDaemonReady(key string, port, pid int, rc *readyChannel, cmd *exec.Cmd) (sessionEntry, error) {
+	rc.close()
 	cmd.Process.Release()
 
 	entry, err := readSessionFile(key)
@@ -483,8 +454,8 @@ func handleDaemonReady(key string, port, pid int, readEnd *os.File, cmd *exec.Cm
 }
 
 //nolint:unparam // sessionEntry return is kept for consistent startDaemon select-case handling
-func handleDaemonPipeError(key string, readErr error, readEnd *os.File, cmd *exec.Cmd, exited chan error) (sessionEntry, error) {
-	readEnd.Close()
+func handleDaemonPipeError(key string, readErr error, rc *readyChannel, cmd *exec.Cmd, exited chan error) (sessionEntry, error) {
+	rc.close()
 	// Wait briefly for daemon exit — pipe EOF usually means it already crashed.
 	// cmd.Wait() completes near-instantly for a dead process; the timeout
 	// handles the rare case where the daemon closed FD 3 but is still running.
@@ -516,7 +487,7 @@ func startDaemon(key string, args []string) (sessionEntry, error) {
 		return entry, nil
 	}
 
-	cmd, readEnd, writeEnd, logFile, err := setupDaemonCmd(key, args)
+	cmd, rc, writeEnd, logFile, err := setupDaemonCmd(key, args)
 	if err != nil {
 		return sessionEntry{}, err
 	}
@@ -525,28 +496,32 @@ func startDaemon(key string, args []string) (sessionEntry, error) {
 
 	if err := cmd.Start(); err != nil {
 		logFile.Close()
-		readEnd.Close()
-		writeEnd.Close()
+		rc.close()
+		if writeEnd != nil {
+			writeEnd.Close()
+		}
 		return sessionEntry{}, fmt.Errorf("starting daemon: %w", err)
 	}
-	writeEnd.Close()
+	if writeEnd != nil {
+		writeEnd.Close()
+	}
 	logFile.Close()
 	newPID := cmd.Process.Pid
 
 	exited := make(chan error, 1)
 	go func() { exited <- cmd.Wait() }()
 
-	portCh, errCh := readPortFromPipe(readEnd)
+	portCh, errCh := rc.readPort()
 
 	select {
 	case port := <-portCh:
-		return handleDaemonReady(key, port, newPID, readEnd, cmd)
+		return handleDaemonReady(key, port, newPID, rc, cmd)
 
 	case readErr := <-errCh:
-		return handleDaemonPipeError(key, readErr, readEnd, cmd, exited)
+		return handleDaemonPipeError(key, readErr, rc, cmd, exited)
 
 	case err := <-exited:
-		readEnd.Close()
+		rc.close()
 		msg := readDaemonLog(key)
 		if msg != "" {
 			return sessionEntry{}, fmt.Errorf("daemon exited: %s", msg)
@@ -554,7 +529,7 @@ func startDaemon(key string, args []string) (sessionEntry, error) {
 		return sessionEntry{}, fmt.Errorf("daemon exited: %w", err)
 
 	case <-time.After(10 * time.Second):
-		readEnd.Close()
+		rc.close()
 		cmd.Process.Kill()
 		<-exited
 		return sessionEntry{}, fmt.Errorf("daemon did not start within 10 seconds")
@@ -583,18 +558,7 @@ func readDaemonLog(key string) string {
 	return strings.TrimSpace(string(data))
 }
 
-// openReadyPipe returns the readiness pipe (FD 3) if this process was
-// spawned as a daemon with _CRIT_READY_FD=3. Returns nil otherwise.
-// The caller owns the returned file and must close it.
-func openReadyPipe() *os.File {
-	if os.Getenv("_CRIT_READY_FD") != "3" {
-		return nil
-	}
-	os.Unsetenv("_CRIT_READY_FD")
-	return os.NewFile(3, "ready-pipe")
-}
-
-// signalReadiness writes the port number to the readiness pipe.
+// signalReadiness writes the port number to the readiness channel.
 // pipe may be nil (not running as daemon), in which case this is a no-op.
 func signalReadiness(pipe *os.File, port int) {
 	if pipe == nil {
@@ -604,7 +568,7 @@ func signalReadiness(pipe *os.File, port int) {
 	pipe.Close()
 }
 
-// daemonFatal reports a startup error through the readiness pipe so the
+// daemonFatal reports a startup error through the readiness channel so the
 // parent process receives a structured message, then exits.
 // pipe may be nil (not running as daemon); the error is always logged to stderr.
 func daemonFatal(pipe *os.File, format string, args ...interface{}) {
@@ -617,11 +581,6 @@ func daemonFatal(pipe *os.File, format string, args ...interface{}) {
 	os.Exit(1)
 }
 
-func daemonSysProcAttr() *syscall.SysProcAttr {
-	return &syscall.SysProcAttr{
-		Setsid: true, // new session, fully detached from controlling terminal
-	}
-}
 
 // stopDaemon stops the daemon for the given session key.
 func stopDaemon(key string) error {
@@ -642,7 +601,7 @@ func stopDaemon(key string) error {
 		return nil //nolint:nilerr // process not found, session already cleaned up
 	}
 
-	if err := proc.Signal(syscall.SIGTERM); err != nil {
+	if err := terminateProcess(proc); err != nil {
 		removeSessionFile(key)
 		return nil //nolint:nilerr // process already gone, cleanup is sufficient
 	}
@@ -651,12 +610,12 @@ func stopDaemon(key string) error {
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		time.Sleep(100 * time.Millisecond)
-		if err := proc.Signal(syscall.Signal(0)); err != nil {
+		if !isProcessAlive(proc) {
 			break // process is gone
 		}
 	}
 	// Still alive? Force kill.
-	if err := proc.Signal(syscall.Signal(0)); err == nil {
+	if isProcessAlive(proc) {
 		proc.Kill()
 	}
 	removeSessionFile(key)
