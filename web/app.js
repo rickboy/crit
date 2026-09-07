@@ -513,6 +513,13 @@
   function findFormForEdit(commentId) {
     return activeForms.find(function(f) { return f.editingId === commentId; });
   }
+
+  // File compose only — edits use createInlineEditor in place of the card.
+  function getFileComposeForm(filePath) {
+    return getFormsForFile(filePath).find(function(f) {
+      return f.scope === 'file' && !f.editingId;
+    });
+  }
   let selectionStart = null;
   let selectionEnd = null;
   let unifiedVisualStart = null; // visual index range for unified drag (cross-number-space)
@@ -2806,7 +2813,7 @@
     const fileComments = isOrphaned
       ? file.comments
       : file.comments.filter(function(c) { return c.scope === 'file'; });
-    const fileForm = getFormsForFile(file.path).find(function(f) { return f.scope === 'file'; });
+    const fileForm = getFileComposeForm(file.path);
     if (fileComments.length > 0 || (fileForm && !isOrphaned)) {
       const fileCommentsContainer = document.createElement('div');
       fileCommentsContainer.className = 'file-comments';
@@ -5178,21 +5185,11 @@
   }
 
   function createFileCommentForm(formObj) {
-    let initialBody = '';
-    if (formObj.editingId) {
-      const file = getFileByPath(formObj.filePath);
-      if (file) {
-        const existing = file.comments.find(function(c) { return c.id === formObj.editingId; });
-        if (existing) initialBody = existing.body;
-      }
-    } else if (formObj.draftBody) {
-      initialBody = formObj.draftBody;
-    }
     return createCommentFormUI({
       formObj: formObj,
-      headerText: formObj.editingId ? 'Editing comment' : 'Comment',
-      submitText: formObj.editingId ? 'Update' : 'Comment',
-      initialBody: initialBody,
+      headerText: 'Comment',
+      submitText: 'Comment',
+      initialBody: formObj.draftBody || '',
       autoFocus: false
     });
   }
@@ -11508,7 +11505,7 @@
 
     if (file) {
       const fileComments = file.comments.filter(function(c) { return c.scope === 'file'; });
-      const fileForm = getFormsForFile(file.path).find(function(f) { return f.scope === 'file'; });
+      const fileForm = getFileComposeForm(file.path);
       if (fileComments.length > 0 || fileForm) {
         const fileCommentsContainer = document.createElement('div');
         fileCommentsContainer.className = 'file-comments';
