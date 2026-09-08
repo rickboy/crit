@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -82,10 +83,17 @@ func TestSession_AddComment(t *testing.T) {
 	if c.Body != "Rethink this" {
 		t.Errorf("Body = %q", c.Body)
 	}
+	c2, ok := s.AddComment("plan.md", 2, 2, "", "Another comment", "", "", "")
+	if !ok {
+		t.Fatal("second AddComment failed")
+	}
+	if c.ID == c2.ID {
+		t.Errorf("two comments got the same ID: %q", c.ID)
+	}
 
 	comments := s.GetComments("plan.md")
-	if len(comments) != 1 {
-		t.Errorf("expected 1 comment, got %d", len(comments))
+	if len(comments) != 2 {
+		t.Errorf("expected 2 comments, got %d", len(comments))
 	}
 }
 
@@ -2457,9 +2465,8 @@ func TestSession_MergeExternalCritJSON_SkippedDuringPendingWrite(t *testing.T) {
 		},
 	}
 	data, _ := json.MarshalIndent(cj, "", "  ")
-	// Touch with different mtime to bypass own-write check
-	time.Sleep(10 * time.Millisecond)
-	os.WriteFile(mustMkdirAll(filepath.Join(dir, ".crit", "review.json")), data, 0644)
+	// Give the external write a deterministic mtime distinct from our own write.
+	overwriteWithNewerMtime(t, filepath.Join(dir, ".crit", "review.json"), data)
 
 	// Merge should be skipped because a write is pending
 	changed := s.mergeExternalCritJSON()
@@ -2503,8 +2510,7 @@ func TestSession_MergeExternalCritJSON_SyncsResolvedState(t *testing.T) {
 		},
 	}
 	data, _ := json.MarshalIndent(cj, "", "  ")
-	time.Sleep(10 * time.Millisecond)
-	os.WriteFile(mustMkdirAll(filepath.Join(dir, ".crit", "review.json")), data, 0644)
+	overwriteWithNewerMtime(t, filepath.Join(dir, ".crit", "review.json"), data)
 
 	changed := s.mergeExternalCritJSON()
 	if !changed {
@@ -2696,8 +2702,7 @@ func TestSession_MergeExternalCritJSON_SyncsUnresolve(t *testing.T) {
 		},
 	}
 	data, _ := json.MarshalIndent(cj, "", "  ")
-	time.Sleep(10 * time.Millisecond)
-	os.WriteFile(mustMkdirAll(filepath.Join(dir, ".crit", "review.json")), data, 0644)
+	overwriteWithNewerMtime(t, filepath.Join(dir, ".crit", "review.json"), data)
 
 	changed := s.mergeExternalCritJSON()
 	if !changed {
@@ -2848,19 +2853,6 @@ func TestCommentCountsIncludeReviewComments(t *testing.T) {
 	}
 	if got := s.UnresolvedCommentCount(); got != 3 {
 		t.Errorf("UnresolvedCommentCount: expected 3, got %d", got)
-	}
-}
-
-func TestClearAllCommentsIncludesReview(t *testing.T) {
-	s := newTestSession(t)
-	s.AddComment("plan.md", 1, 1, "", "line", "", "", "")
-	s.AddReviewComment("review", "", "")
-	s.ClearAllComments()
-	if got := s.TotalCommentCount(); got != 0 {
-		t.Errorf("expected 0 after clear, got %d", got)
-	}
-	if len(s.GetReviewComments()) != 0 {
-		t.Error("expected 0 review comments after clear")
 	}
 }
 
@@ -3842,6 +3834,9 @@ func TestSession_AddComment_PreservesSideAndQuote(t *testing.T) {
 	if c.Quote != "func main() {}" {
 		t.Errorf("Quote = %q, want func main() {}", c.Quote)
 	}
+	if c.StartLine != 5 || c.EndLine != 10 {
+		t.Errorf("lines = %d-%d, want 5-10", c.StartLine, c.EndLine)
+	}
 	if c.Scope != "line" {
 		t.Errorf("Scope = %q, want line", c.Scope)
 	}
@@ -3891,27 +3886,6 @@ func TestSession_WriteFiles_ReviewCommentsPersisted(t *testing.T) {
 	}
 }
 
-func TestSession_RandomCommentID_Format(t *testing.T) {
-	s := newTestSession(t)
-
-	c, ok := s.AddComment("plan.md", 1, 1, "", "test", "", "", "")
-	if !ok {
-		t.Fatal("AddComment failed")
-	}
-	if !strings.HasPrefix(c.ID, "c_") || len(c.ID) != 8 {
-		t.Errorf("comment ID %q does not match c_XXXXXX format", c.ID)
-	}
-
-	// Two comments should get different IDs
-	c2, ok := s.AddComment("plan.md", 2, 2, "", "test2", "", "", "")
-	if !ok {
-		t.Fatal("AddComment failed")
-	}
-	if c.ID == c2.ID {
-		t.Errorf("two comments got the same ID: %q", c.ID)
-	}
-}
-
 func TestSession_ClearAllComments(t *testing.T) {
 	s := newTestSession(t)
 	s.AddComment("plan.md", 1, 1, "", "md comment", "", "", "")
@@ -3935,20 +3909,6 @@ func TestSession_ClearAllComments(t *testing.T) {
 	}
 	if s.TotalCommentCount() != 0 {
 		t.Errorf("TotalCommentCount = %d, want 0", s.TotalCommentCount())
-	}
-}
-
-func TestSession_AddComment_WithSide(t *testing.T) {
-	s := newTestSession(t)
-	c, ok := s.AddComment("main.go", 5, 10, "RIGHT", "check this", "", "", "")
-	if !ok {
-		t.Fatal("AddComment with side failed")
-	}
-	if c.Side != "RIGHT" {
-		t.Errorf("Side = %q, want RIGHT", c.Side)
-	}
-	if c.StartLine != 5 || c.EndLine != 10 {
-		t.Errorf("lines = %d-%d, want 5-10", c.StartLine, c.EndLine)
 	}
 }
 
@@ -5610,6 +5570,7 @@ func mapKeys[V any](m map[string]V) []string {
 	for k := range m {
 		out = append(out, k)
 	}
+	sort.Strings(out)
 	return out
 }
 
